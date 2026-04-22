@@ -1,0 +1,63 @@
+// NN.Notification.Service Prisma schema.
+// Stores per-user, per-tenant notifications so the platform frontend can
+// render a bell with unread count + history.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum NotificationCategory {
+  payment
+  estimate
+  system
+  email
+  shipping
+  inventory
+}
+
+enum NotificationSeverity {
+  info
+  success
+  warn
+  error
+}
+
+model Notification {
+  id          String                @id @default(uuid()) @db.Uuid
+  tenantId    String                @db.Uuid
+  /// null = broadcast to whole tenant
+  userId      String?               @db.Uuid
+
+  category    NotificationCategory
+  severity    NotificationSeverity  @default(info)
+
+  /// Short headline (e.g. "Estimate paid")
+  title       String                @db.VarChar(200)
+  /// Longer text shown in the notification list
+  message     String                @db.VarChar(2000)
+
+  /// Optional link the bell should navigate to when clicked
+  actionUrl   String?               @db.VarChar(2000)
+  /// Free-form payload (estimateId, sessionId, amount, …)
+  data        Json?
+
+  /// Source event id (e.g. Stripe cs_xxx) for idempotent inserts
+  sourceEventId  String?            @db.VarChar(255)
+  sourceTopic    String?            @db.VarChar(120)
+
+  isRead      Boolean               @default(false)
+  readAt      DateTime?
+
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  @@index([tenantId, isRead, createdAt])
+  @@index([tenantId, userId, createdAt])
+  @@index([sourceEventId])
+  @@map("Notifications")
+}

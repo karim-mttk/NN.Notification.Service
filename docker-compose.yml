@@ -1,0 +1,19 @@
+version: '3.9'
+
+services:
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nn-notification-service
+    ports:
+      - '5070:5070'
+    env_file:
+      - .env
+    networks:
+      - nn-shared-network
+    restart: unless-stopped
+
+networks:
+  nn-shared-network:
+    external: true
