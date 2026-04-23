@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   notification-service:
     build:
@@ -11,9 +9,12 @@ services:
     env_file:
       - .env
     networks:
+      - nn-backend-network
       - nn-shared-network
     restart: unless-stopped
 
 networks:
+  nn-backend-network:
+    external: true
   nn-shared-network:
     external: true

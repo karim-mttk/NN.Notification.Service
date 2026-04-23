@@ -22,14 +22,16 @@ export const PAYMENT_STATUS = {
 } as const;
 
 export async function updateEstimatePaymentStatus(
+  tenantId: string,
   estimateId: string,
-  body: UpdateEstimatePaymentDto
+  body: UpdateEstimatePaymentDto,
+  userId?: string | null,
 ): Promise<boolean> {
   if (!OPERATIONS_API_URL) {
     logger.warn('[operations] OPERATIONS_API_URL not configured, skipping callback');
     return false;
   }
-  const token = await getServiceToken();
+  const token = await getServiceToken(tenantId, userId);
   if (!token) {
     logger.warn('[operations] No service token available, callback skipped for %s', estimateId);
     return false;

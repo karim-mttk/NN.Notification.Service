@@ -1,7 +1,15 @@
 import notificationService from '@/modules/notification/notification.service';
-import { publishRealtimeNotification, publishEmailRequest } from '@/kafka/producer';
+import { publishRealtimeNotification } from '@/kafka/producer';
 import { updateEstimatePaymentStatus, PAYMENT_STATUS } from '@/clients/operationsClient';
 import logger from '@/utils/logger';
+
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function normalizeUserId(userId?: string | null): string | null {
+  if (!userId) return null;
+  return UUID_RE.test(userId) ? userId : null;
+}
 
 /**
  * Wire-format of a payment event published by NN.Payment.Backend.
@@ -37,15 +45,16 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
   }
 
   const isEstimate = evt.checkoutType === 'EstimatePayment' && !!evt.estimateId;
+  const notificationUserId = normalizeUserId(evt.userId);
 
   // 1. Operational backend callback (only for estimate payments)
   if (isEstimate && evt.estimateId) {
-    await updateEstimatePaymentStatus(evt.estimateId, {
+    await updateEstimatePaymentStatus(evt.tenantId, evt.estimateId, {
       paymentStatus: PAYMENT_STATUS.Paid,
       paymentSessionId: evt.gatewaySessionId,
       amountPaid: evt.amount,
       paidAt: evt.occurredAt,
-    });
+    }, notificationUserId);
   }
 
   const title = isEstimate ? 'Estimate paid' : 'Payment received';
@@ -58,7 +67,7 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
   try {
     await notificationService.create({
       tenantId: evt.tenantId,
-      userId: evt.userId ?? null,
+      userId: notificationUserId,
       category: isEstimate ? 'estimate' : 'payment',
       severity: 'success',
       title,
@@ -82,7 +91,7 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
   try {
     await publishRealtimeNotification({
       tenantId: evt.tenantId,
-      userId: evt.userId ?? null,
+      userId: notificationUserId,
       type: isEstimate ? 'estimate.paid' : 'payment.received',
       title,
       message,
