@@ -14,6 +14,7 @@ KafkaJS service (port **5070**).
 4. Publish to `notifications.realtime` so the WebSocket Gateway broadcasts to
    connected browsers.
 5. Expose REST for the frontend bell:
+   - `POST /api/notifications` — create a notification row (used by trusted backend services)
    - `GET /api/notifications` — list (filter by `isRead`, `category`)
    - `GET /api/notifications/unread-count`
    - `PATCH /api/notifications/:id/read`

@@ -10,6 +10,22 @@ function user(req: Request) {
 }
 
 export class NotificationController {
+  async create(req: Request, res: Response) {
+    const created = await service.create({
+      tenantId: tenant(req),
+      userId: req.body.userId ?? null,
+      category: req.body.category as NotificationCategory,
+      severity: req.body.severity,
+      title: String(req.body.title ?? ''),
+      message: String(req.body.message ?? ''),
+      actionUrl: req.body.actionUrl ? String(req.body.actionUrl) : undefined,
+      data: req.body.data,
+      sourceEventId: req.body.sourceEventId ? String(req.body.sourceEventId) : undefined,
+      sourceTopic: req.body.sourceTopic ? String(req.body.sourceTopic) : undefined,
+    });
+    res.status(201).json(created);
+  }
+
   async list(req: Request, res: Response) {
     const isReadQ = req.query.isRead;
     const isRead =

@@ -6,6 +6,7 @@ const router = Router();
 
 router.use(authenticate, requireTenant);
 
+router.post('/', (req, res) => controller.create(req, res));
 router.get('/', (req, res) => controller.list(req, res));
 router.get('/unread-count', (req, res) => controller.unreadCount(req, res));
 router.patch('/read-all', (req, res) => controller.markAllRead(req, res));
