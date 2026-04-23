@@ -2,12 +2,17 @@
 // Mirrors the verification used by NN.UGP.Email.Service.
 
 import { Request, Response, NextFunction } from 'express';
+import axios from 'axios';
 import jwt, { JwtPayload, VerifyErrors } from 'jsonwebtoken';
 import logger from '../utils/logger';
 
 const JWT_SECRET = process.env.JWT_SECRET_KEY!;
 const JWT_ISSUER = process.env.JWT_ISSUER!;
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE!;
+const AUTH_API_URL = process.env.AUTH_API_URL || '';
+const NOTIFICATION_PROXY_SECRET = (process.env.NOTIFICATION_PROXY_SECRET || '').trim();
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 if (!JWT_SECRET) throw new Error('JWT_SECRET_KEY env variable is required');
 if (!JWT_ISSUER) throw new Error('JWT_ISSUER env variable is required');
@@ -33,6 +38,64 @@ function extractRoles(p: JwtPayload): string[] {
   if (Array.isArray(single)) return [...fromArray, ...single];
   if (single) return [...fromArray, single];
   return fromArray;
+}
+
+function requestedTenantId(req: Request): string | undefined {
+  const value = req.headers['x-organization-id'];
+  const first = Array.isArray(value) ? value[0] : value;
+  const trimmed = first?.trim();
+  return trimmed && UUID_RE.test(trimmed) ? trimmed : undefined;
+}
+
+function hasTrustedProxyOverride(req: Request): boolean {
+  if (!NOTIFICATION_PROXY_SECRET) {
+    return false;
+  }
+
+  const value = req.headers['x-notification-proxy-secret'];
+  const first = Array.isArray(value) ? value[0] : value;
+  return typeof first === 'string' && first.trim() === NOTIFICATION_PROXY_SECRET;
+}
+
+function hasTenantOverrideRole(roles: string[]): boolean {
+  return roles.some((role) => {
+    const normalized = role.toLowerCase();
+    return normalized === 'admin' || normalized === 'systemadmin' || normalized === 'superadmin';
+  });
+}
+
+async function verifyOrganizationAccess(req: Request, organizationId: string): Promise<boolean> {
+  if (!AUTH_API_URL) {
+    logger.warn('[auth] AUTH_API_URL not configured, cannot verify organization override');
+    return false;
+  }
+
+  const auth = req.headers.authorization;
+  if (!auth) {
+    return false;
+  }
+
+  try {
+    const url = `${AUTH_API_URL.replace(/\/$/, '')}/api/user/by-organization/${organizationId}`;
+    const response = await axios.get(url, {
+      headers: {
+        Authorization: auth,
+        Accept: 'application/json',
+      },
+      timeout: 7_000,
+    });
+
+    const users = Array.isArray(response.data?.data) ? response.data.data : [];
+    return users.some((user: { id?: string }) => user.id === req.user?.userId);
+  } catch (error: any) {
+    logger.warn(
+      '[auth] Failed tenant override verification for user %s org %s: %s',
+      req.user?.userId,
+      organizationId,
+      error.response?.status ? `status ${error.response.status}` : error.message,
+    );
+    return false;
+  }
 }
 
 declare module 'express-serve-static-core' {
@@ -84,6 +147,33 @@ export function authenticate(req: Request, res: Response, next: NextFunction) {
 }
 
 export function requireTenant(req: Request, res: Response, next: NextFunction) {
-  if (!req.user?.tenantId) return res.status(403).json({ message: 'Tenant context required' });
-  next();
+  const overrideTenantId = requestedTenantId(req);
+
+  if (overrideTenantId && overrideTenantId === req.user?.tenantId) {
+    req.user.tenantId = overrideTenantId;
+    return next();
+  }
+
+  if (!overrideTenantId) {
+    if (!req.user?.tenantId) return res.status(403).json({ message: 'Tenant context required' });
+    return next();
+  }
+
+  if (req.user && hasTrustedProxyOverride(req)) {
+    req.user.tenantId = overrideTenantId;
+    return next();
+  }
+
+  if (!req.user || !hasTenantOverrideRole(req.user.roles)) {
+    return res.status(403).json({ message: 'Organization override is not allowed' });
+  }
+
+  void verifyOrganizationAccess(req, overrideTenantId).then((hasAccess) => {
+    if (!hasAccess) {
+      return res.status(403).json({ message: 'Organization access denied' });
+    }
+
+    req.user!.tenantId = overrideTenantId;
+    next();
+  });
 }

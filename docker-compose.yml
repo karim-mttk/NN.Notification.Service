@@ -8,6 +8,8 @@ services:
       - '5070:5070'
     env_file:
       - .env
+    environment:
+      - NOTIFICATION_PROXY_SECRET=platform-notification-proxy-20260423
     networks:
       - nn-backend-network
       - nn-shared-network
