@@ -475,3 +475,31 @@ room. Every connected operator receives the toast immediately and the bell
 counter is now correct *per user* on the next REST refresh. We deliberately
 do NOT pre-create receipts for everyone in the org — receipts only exist on
 explicit read.
+
+## Apr 24 2026 — Turn 3: stack-wide container hardening
+
+This service's `KafkaPaymentConsumer` reconnect logic (added earlier
+today) is now mirrored in `NN.UGP.Email.Service/src/worker/KafkaEmailConsumer.ts`
+so the email pipeline self-heals across kafka outages the same way the
+notification dispatcher does.
+
+Cross-cutting changes that affect notification debugging:
+
+- Root `docker-compose.yml` `kafka` and `redis` services now have
+  `restart: unless-stopped` (they previously had no restart policy at
+  all, which is why a single broker crash could silently freeze the
+  entire notification pipeline).
+- `websocket-gateway` and `email-worker` now have container
+  `healthcheck` directives. Use `docker ps` to spot wedged containers:
+  ones that show `(unhealthy)` should be restarted by Docker
+  automatically.
+- `NN.WebSocket.Gateway/src/app.ts` `bootstrap()` no longer
+  `process.exit(1)`s on transient `This server does not host this
+  topic-partition` errors during kafka leader election; it retries
+  consumer attachment with backoff in the background while the HTTP
+  server stays up. Live sockets no longer drop on kafka recreate.
+
+Practical implication: when validating the paid-estimate flow you can
+now `docker compose up -d --build kafka` without losing connected
+operator dashboards. Previously this would tear down all socket
+connections and require manual page reloads.
