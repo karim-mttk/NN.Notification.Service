@@ -11,8 +11,10 @@ const JWT_ISSUER = process.env.JWT_ISSUER!;
 const JWT_AUDIENCE = process.env.JWT_AUDIENCE!;
 const AUTH_API_URL = process.env.AUTH_API_URL || '';
 const NOTIFICATION_PROXY_SECRET = (process.env.NOTIFICATION_PROXY_SECRET || '').trim();
+// RFC 4122 UUID layout, version-agnostic. Auth Server issues v7 (time-
+// ordered) ids in some claims; restricting to v1-v5 silently rejects them.
 const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 if (!JWT_SECRET) throw new Error('JWT_SECRET_KEY env variable is required');
 if (!JWT_ISSUER) throw new Error('JWT_ISSUER env variable is required');

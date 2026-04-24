@@ -289,11 +289,189 @@ cd /Volumes/EXTSSD/platform/NN.Platform.Frontend && docker compose up -d --build
 
 Check these in order:
 
-1. Confirm notifications are still being created in the Notification DB.
-2. Confirm the missing notification belongs to the active org, not just the JWT
+1. Confirm the Kafka consumer actually started. Look for
+   `[KafkaConsumer] subscribed to payment.events` in `nn-notification-service`
+   logs *after the latest restart*. If the most recent log line for that
+   subsystem is `[KafkaConsumer] failed to start: ...` with no later
+   `subscribed` or `reconnect attempt` line, the consumer is dead and no
+   payment events are being processed (see Section: Apr 24 2026 second bug).
+2. Confirm notifications are still being created in the Notification DB.
+3. Confirm the missing notification belongs to the active org, not just the JWT
    org claim.
-3. Confirm the frontend request is going through
+4. Confirm the frontend request is going through
    `/api/notifications` on port `3000`, not directly to port `5070`.
-4. Confirm both services have the same `NOTIFICATION_PROXY_SECRET` value.
-5. Rebuild both Docker services before trusting any runtime result.
-6. Only after that, revisit Kafka/dispatcher issues.
+5. Confirm both services have the same `NOTIFICATION_PROXY_SECRET` value.
+6. Rebuild both Docker services before trusting any runtime result.
+
+## Apr 24 2026 Second Bug: Kafka Consumer Never Retried After Startup Failure
+
+Observed symptom (reported by user):
+
+- Customer paid an estimate via Stripe (sync endpoint returned
+  `status=complete, paid=true`).
+- Operations dashboard never flipped the estimate to Paid.
+- Customer never received the `estimate-paid` confirmation email.
+- Admin bell never showed the new notification.
+- All upstream pieces were healthy: payment backend logged
+  `Published checkout.completed for stripe/cs_test_... to payment.events`.
+
+Root cause:
+
+- After a notification-service restart, the Kafka broker briefly refused
+  the connection and `startKafkaPaymentConsumer()` logged
+  `[KafkaConsumer] failed to start: connect ECONNREFUSED 172.22.0.11:9092`.
+- The original implementation wrapped consumer setup in a single `try/catch`
+  with no retry. After that one failure the process kept running (HTTP API
+  was healthy) but no Kafka messages were ever consumed.
+- Every subsequent paid estimate silently piled up in the Kafka topic with
+  nobody consuming them.
+
+Fix applied (file:
+`NN.Notification.Service/src/worker/KafkaPaymentConsumer.ts`):
+
+- Extracted consumer bring-up into `startConsumerOnce()`.
+- Added `scheduleReconnect()` with exponential backoff capped at 30s.
+- Initial `startKafkaPaymentConsumer()` no longer blocks process startup; if
+  the first attempt fails, it schedules reconnects in the background.
+- Subscribed to the kafkajs `CRASH` and `DISCONNECT` consumer events. On
+  crash the consumer is cleared and a reconnect loop is started.
+- `stopKafkaPaymentConsumer()` sets a `stopped` flag so reconnect loops exit
+  cleanly on shutdown.
+
+Validation performed (Apr 24 2026):
+
+- Rebuilt `nn-notification-service` via
+  `docker compose up -d --build notification-service`.
+- After restart, container logged
+  `[KafkaConsumer] subscribed to payment.events (group=notification-dispatcher)`
+  immediately, then *replayed the previously dropped event*:
+  `[operations] Updated estimate 94a78506-dd43-408f-9e25-fd08dd24aba9 →
+  paymentStatus=2`.
+- Operations EF UPDATE on `Estimates` fired with new PaymentStatus/PaidAt.
+- Email worker logged
+  `[Worker] Email 0a74e947-... sent via resend (messageId: dae98872-...)`.
+- Notification row persisted: tenantId `e986dd42-...`, category `estimate`,
+  title `Estimate paid`, userId `null` (broadcast).
+
+Why this matters going forward:
+
+- A bad Kafka startup window (broker still booting, transient DNS, network
+  reattach) used to silently kill the entire payment notification pipeline
+  until someone manually restarted the service.
+- With the retry loop in place, the consumer self-heals and the next paid
+  estimate flows end to end without intervention.
+- Quick health probe: any Kafka outage now leaves a trail of
+  `[KafkaConsumer] reconnect attempt (brokers=...)` lines instead of going
+  silent.
+
+Reference test estimate: `94a78506-dd43-408f-9e25-fd08dd24aba9`
+(tenant `e986dd42-5dbf-42df-94af-aab4c4cbab52`,
+Stripe session `cs_test_a1bIl50Lgtx5kUQS1Rz1Ey3kdCJWvPQiPrgxP9Pe5ZIFiFBN37fxAPydsF`).
+
+## Apr 24 2026 — Turn 2: UUID v7 user ids dropped, bell stayed empty
+
+### Symptom
+Confirmation emails arrived but the dashboard bell never showed
+estimate-paid notifications. New rows from the Kafka payment events were
+being persisted, but they were saved with `userId = null` and the
+`/api/notifications` queries returned them only for the user whose JWT
+tenant exactly matched the row's tenant.
+
+### Root Cause
+`UUID_RE` in `src/worker/NotificationDispatcher.ts` and
+`src/middleware/jwtAuth.ts` was:
+
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+This rejects UUID v7 — Auth Server now issues v7 ids, e.g.
+`019db03b-b446-793b-9820-2384ff608809` (third group starts with `7`).
+`normalizeUserId` therefore returned `null` for every payment event,
+and the JWT middleware also dropped v7 organization claims.
+
+The bell read queries (`list`, `unreadCount`, `markRead`, `markAllRead`)
+also did not surface user-targeted rows when an operator switched their
+active organization in the UI.
+
+### Fix
+1. Relaxed `UUID_RE` to accept any version nibble and any variant nibble
+   in both files.
+2. Rewrote the four query helpers in
+   `src/modules/notification/notification.service.ts` to use a 3-clause OR:
+   `{tenantId, userId: null}` (broadcast) | `{tenantId, userId}` (targeted in
+   active tenant) | `{userId}` (cross-tenant user-targeted).
+
+### Verification
+Direct curl after rebuild:
+
+```
+JWT(org=8a07) /api/notifications/unread-count        -> {"count":0}
+JWT(org=8a07) + X-Organization-Id: e986... (proxy)   -> {"count":11}
+Direct :5070, mismatched JWT + override (no secret)  -> "Organization access denied"
+```
+
+
+## Apr 24 2026 — Turn 3: Per-user read state for org-wide notifications
+
+### Requirement
+Org-wide events (e.g. "Estimate paid") must be visible to every user of the
+organisation, but the bell's red unread badge must be tracked per user.
+When user A clicks a notification, user B should still see it as unread.
+
+### What was wrong
+Until now there was a single `isRead` / `readAt` pair on the `Notifications`
+row itself. For broadcast rows (`userId IS NULL`) that meant the very first
+operator who marked it read flipped the flag for the whole organisation —
+nobody else's bell would show the red dot any more.
+
+### Fix
+New table `NotificationReceipts (notificationId, userId, readAt)` with a
+composite PK. A row exists ONLY when that user has read that notification.
+
+- `prisma/schema.prisma`: added `NotificationReceipt` model + back-relation
+  on `Notification.receipts`.
+- `notification.service.ts`:
+  - `unreadCount(tenantId, userId)`: visibility OR + `receipts: { none: { userId } }`.
+  - `list(...)`: includes `receipts: { where: { userId }, take: 1 }` and
+    projects per-user `isRead` / `readAt` via `projectForUser(...)`.
+  - `markRead(id, ...)`: upserts a single receipt row (no longer mutates the
+    notification itself).
+  - `markAllRead(...)`: finds visible-to-user rows lacking a receipt and
+    `createMany` them in one shot.
+- The legacy `Notification.isRead` / `readAt` columns are kept (back-compat)
+  but are no longer read or written by the API — they appear on the schema
+  with a doc comment marking them legacy.
+
+### DB migration applied to RDS
+`prisma db push` from inside the container hangs against this RDS instance
+(observed: spinner never returns). Worked around by executing raw DDL via
+the existing Prisma client:
+
+```sh
+docker cp scripts/check-receipts.js nn-notification-service:/app/check.js
+docker exec -w /app nn-notification-service node check.js
+```
+
+The script is idempotent: `to_regclass` first, then `CREATE TABLE IF NOT
+EXISTS` + `CREATE INDEX IF NOT EXISTS`. Keep
+`scripts/check-receipts.js` around — it's the safe way to apply additive
+DDL to this RDS.
+
+### Verification (per-user read isolation)
+Inserted a fresh broadcast row, then:
+
+```
+                          A unread   B unread   A.isRead   B.isRead
+both visible (broadcast)        9          9      false      false
+A marks NID read                8          9      true       false
+B marks NID read                8          8      true       true
+```
+
+Source: `/tmp/peruser2.sh` (uses two JWTs for the same org, one for each user).
+
+### Important caveat for the realtime push
+When the WS gateway publishes a broadcast event (`payment.events`), the
+notification is created with `userId=null` AND broadcast on the tenant
+room. Every connected operator receives the toast immediately and the bell
+counter is now correct *per user* on the next REST refresh. We deliberately
+do NOT pre-create receipts for everyone in the org — receipts only exist on
+explicit read.
