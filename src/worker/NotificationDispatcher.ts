@@ -51,9 +51,13 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
   const isEstimate = evt.checkoutType === 'EstimatePayment' && !!evt.estimateId;
   const notificationUserId = normalizeUserId(evt.userId);
 
-  // 1. Operational backend callback (only for estimate payments)
+  // 1. Operational backend callback (only for estimate payments). The
+  //    operations backend itself decides whether this payment closes the
+  //    estimate (Paid) or only contributes to it (PartiallyPaid). We send
+  //    the raw amount with status=Paid as a hint and trust the response.
+  let opsResult: Awaited<ReturnType<typeof updateEstimatePaymentStatus>> = null;
   if (isEstimate && evt.estimateId) {
-    await updateEstimatePaymentStatus(evt.tenantId, evt.estimateId, {
+    opsResult = await updateEstimatePaymentStatus(evt.tenantId, evt.estimateId, {
       paymentStatus: PAYMENT_STATUS.Paid,
       paymentSessionId: evt.gatewaySessionId,
       amountPaid: evt.amount,
@@ -61,11 +65,23 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
     }, notificationUserId);
   }
 
-  const title = isEstimate ? 'Estimate paid' : 'Payment received';
-  const message = isEstimate
-    ? `Estimate payment of ${evt.amount.toFixed(2)} ${evt.currency.toUpperCase()} has been received.`
-    : `A payment of ${evt.amount.toFixed(2)} ${evt.currency.toUpperCase()} has been received.`;
-  const actionUrl = isEstimate ? `/operations/payments` : `/operations/payments`;
+  const isPartial = opsResult?.paymentStatus === PAYMENT_STATUS.PartiallyPaid;
+  const remaining = opsResult?.amountRemaining ?? 0;
+  const currencyUpper = evt.currency.toUpperCase();
+
+  let title: string;
+  let message: string;
+  if (!isEstimate) {
+    title = 'Payment received';
+    message = `A payment of ${evt.amount.toFixed(2)} ${currencyUpper} has been received.`;
+  } else if (isPartial) {
+    title = 'Partial estimate payment received';
+    message = `Partial payment of ${evt.amount.toFixed(2)} ${currencyUpper} received. Remaining balance: ${currencyUpper} ${remaining.toFixed(2)}.`;
+  } else {
+    title = 'Estimate paid';
+    message = `Estimate payment of ${evt.amount.toFixed(2)} ${currencyUpper} has been received in full.`;
+  }
+  const actionUrl = `/operations/payments`;
 
   // 2. Persisted bell history
   try {
@@ -83,6 +99,9 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
         amount: evt.amount,
         currency: evt.currency,
         sessionId: evt.gatewaySessionId,
+        isPartial,
+        amountRemaining: remaining,
+        aggregatePaymentStatus: opsResult?.paymentStatus,
       },
       sourceEventId: evt.gatewaySessionId,
       sourceTopic: 'payment.events',
@@ -96,7 +115,9 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
     await publishRealtimeNotification({
       tenantId: evt.tenantId,
       userId: notificationUserId,
-      type: isEstimate ? 'estimate.paid' : 'payment.received',
+      type: isEstimate
+        ? (isPartial ? 'estimate.partial_paid' : 'estimate.paid')
+        : 'payment.received',
       title,
       message,
       severity: 'success',
@@ -106,6 +127,8 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
         amount: evt.amount,
         currency: evt.currency,
         sessionId: evt.gatewaySessionId,
+        isPartial,
+        amountRemaining: remaining,
         actionUrl,
       },
     });

@@ -503,3 +503,36 @@ Practical implication: when validating the paid-estimate flow you can
 now `docker compose up -d --build kafka` without losing connected
 operator dashboards. Previously this would tear down all socket
 connections and require manual page reloads.
+
+
+## Apr 25 2026 — Partial Payment Notifications
+
+The `payment.events` Kafka contract did **not** change for partial payments.
+Each Stripe checkout (whether it represents 30%, 50% or 100% of an estimate)
+is one paid `payment.events` message with an `amount` field. The Operations
+Backend decides if the resulting estimate is `Paid` or `PartiallyPaid`.
+
+**Operations callback (`operationsClient.ts`) now returns the response body**
+typed as `EstimatePaymentResultSummary { paymentStatus, amountPaid,
+amountRemaining, totalEstimates, discount }`. This avoids a second HTTP
+round-trip when the dispatcher needs to know the aggregate state.
+
+**Constant added:** `PAYMENT_STATUS.PartiallyPaid = 6` (mirrors .NET enum).
+
+**`NotificationDispatcher` flow (estimate payments):**
+1. POST to operations `/api/estimates/{id}/payment-status` with
+   `{ paymentStatus: Paid, paymentSessionId, amountPaid, paidAt }`. The
+   operations service may downgrade to `PartiallyPaid` and that response
+   tells us which.
+2. Branch on `opsResult?.paymentStatus`:
+   - `PartiallyPaid` → title `"Partial estimate payment received"`,
+     message `"Partial payment of $X received. Remaining balance: $Y"`,
+     realtime type `estimate.partial_paid`.
+   - `Paid` → title `"Estimate paid"`, type `estimate.paid`.
+3. Persist bell history with `data.isPartial`, `amountRemaining`,
+   `aggregatePaymentStatus`. The realtime push includes the same fields so
+   the WebSocket gateway / Operations Dashboard can colour-code partial vs
+   full notifications without an extra HTTP call.
+
+If the operations callback fails (`opsResult == null`), the dispatcher
+falls through to the "Estimate paid" branch (best-effort behaviour).

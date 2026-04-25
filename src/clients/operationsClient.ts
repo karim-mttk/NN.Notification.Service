@@ -19,37 +19,51 @@ export const PAYMENT_STATUS = {
   Failed: 3,
   Expired: 4,
   Refunded: 5,
+  PartiallyPaid: 6,
 } as const;
+
+/**
+ * Subset of fields we read off the operations callback response so we can
+ * fan out a partial-vs-full notification correctly without a second HTTP
+ * round-trip.
+ */
+export interface EstimatePaymentResultSummary {
+  paymentStatus: number;
+  amountPaid?: number | null;
+  amountRemaining?: number | null;
+  totalEstimates?: number | null;
+  discount?: number | null;
+}
 
 export async function updateEstimatePaymentStatus(
   tenantId: string,
   estimateId: string,
   body: UpdateEstimatePaymentDto,
   userId?: string | null,
-): Promise<boolean> {
+): Promise<EstimatePaymentResultSummary | null> {
   if (!OPERATIONS_API_URL) {
     logger.warn('[operations] OPERATIONS_API_URL not configured, skipping callback');
-    return false;
+    return null;
   }
   const token = await getServiceToken(tenantId, userId);
   if (!token) {
     logger.warn('[operations] No service token available, callback skipped for %s', estimateId);
-    return false;
+    return null;
   }
   try {
     const url = `${OPERATIONS_API_URL.replace(/\/$/, '')}/api/estimates/${estimateId}/payment-status`;
-    await axios.post(url, body, {
+    const resp = await axios.post<EstimatePaymentResultSummary>(url, body, {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       timeout: 7_000,
     });
-    logger.info('[operations] Updated estimate %s → paymentStatus=%s', estimateId, body.paymentStatus);
-    return true;
+    logger.info('[operations] Updated estimate %s → paymentStatus=%s', estimateId, resp.data?.paymentStatus);
+    return resp.data ?? null;
   } catch (err: any) {
     logger.error(
       '[operations] Failed to update estimate %s: %s',
       estimateId,
       err.response?.data ? JSON.stringify(err.response.data) : err.message
     );
-    return false;
+    return null;
   }
 }
