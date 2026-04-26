@@ -68,6 +68,7 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
   const isPartial = opsResult?.paymentStatus === PAYMENT_STATUS.PartiallyPaid;
   const remaining = opsResult?.amountRemaining ?? 0;
   const currencyUpper = evt.currency.toUpperCase();
+  const estRef = evt.estimateId ? `#${evt.estimateId.slice(0, 8).toUpperCase()}` : '';
 
   let title: string;
   let message: string;
@@ -75,11 +76,16 @@ export async function dispatchPaymentEvent(evt: PaymentEvent): Promise<void> {
     title = 'Payment received';
     message = `A payment of ${evt.amount.toFixed(2)} ${currencyUpper} has been received.`;
   } else if (isPartial) {
-    title = 'Partial estimate payment received';
-    message = `Partial payment of ${evt.amount.toFixed(2)} ${currencyUpper} received. Remaining balance: ${currencyUpper} ${remaining.toFixed(2)}.`;
+    title = `Estimate ${estRef} — partial payment received`.trim();
+    message =
+      `Partial payment of ${currencyUpper} ${evt.amount.toFixed(2)} received` +
+      (estRef ? ` for estimate ${estRef}` : '') +
+      `. Remaining balance: ${currencyUpper} ${remaining.toFixed(2)}.`;
   } else {
-    title = 'Estimate paid';
-    message = `Estimate payment of ${evt.amount.toFixed(2)} ${currencyUpper} has been received in full.`;
+    title = `Estimate ${estRef} — fully paid`.trim();
+    message =
+      `Estimate ${estRef ? estRef + ' ' : ''}has been fully paid. ` +
+      `This payment: ${currencyUpper} ${evt.amount.toFixed(2)}.`;
   }
   const actionUrl = `/operations/payments`;
 

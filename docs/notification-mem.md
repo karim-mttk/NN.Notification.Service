@@ -536,3 +536,35 @@ round-trip when the dispatcher needs to know the aggregate state.
 
 If the operations callback fails (`opsResult == null`), the dispatcher
 falls through to the "Estimate paid" branch (best-effort behaviour).
+
+---
+
+## Apr 26 2026 — Partial vs full estimate notifications now distinct
+
+**Bug:** Bell showed "Estimate paid" for every estimate payment, even
+clearly partial ones (e.g. $143.40 against a $478 estimate). DB
+inspection of the `notification.data` JSON showed `isPartial`,
+`amountRemaining`, `aggregatePaymentStatus` keys missing entirely
+— proof the running container had stale compiled code from before the
+partial-payment dispatcher rewrite.
+
+**Fix:**
+1. Rebuilt `nn-notification-service` to pick up `dispatchPaymentEvent`
+   changes that read `opsResult.paymentStatus` /
+   `opsResult.amountRemaining` from the operations
+   `/api/estimates/{id}/payment-status` response. Conflict on container
+   name required `docker rm -f` first.
+2. Sharpened the copy so partial vs full payments are visibly distinct
+   in the bell:
+   - Partial:  `"Estimate #DE104ED4 — partial payment received"` /
+     `"Partial payment of USD 143.40 received for estimate #DE104ED4. Remaining balance: USD 334.60."`
+   - Full: `"Estimate #DE104ED4 — fully paid"` /
+     `"Estimate #DE104ED4 has been fully paid. This payment: USD 167.30."`
+
+   Realtime event `type` was already correctly split into
+   `estimate.partial_paid` vs `estimate.paid`.
+
+**Lesson:** `docker compose up -d --build` does NOT recreate the
+container if the image hash is unchanged but you also bumped a
+schema/code path that relied on the new image — when in doubt,
+`docker rm -f <name> && docker compose up -d` to force recreate.
