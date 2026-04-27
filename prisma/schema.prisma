@@ -83,3 +83,20 @@ model NotificationReceipt {
   @@index([userId, readAt])
   @@map("NotificationReceipts")
 }
+
+/// Per-user, per-tenant cutoff that anchors the earliest notification a user
+/// is allowed to see in a given tenant. A row is lazily created the first
+/// time a user touches the bell for that tenant (list / unreadCount /
+/// markRead / markAllRead). Notifications with `createdAt < sinceAt` are
+/// invisible to that user. This prevents brand-new users from inheriting
+/// the entire historical broadcast feed of the org/dashboard they joined,
+/// and stops cross-tenant leakage of legacy rows.
+model NotificationVisibilityCutoff {
+  tenantId  String   @db.Uuid
+  userId    String   @db.Uuid
+  sinceAt   DateTime @default(now())
+
+  @@id([tenantId, userId])
+  @@index([userId])
+  @@map("NotificationVisibilityCutoffs")
+}

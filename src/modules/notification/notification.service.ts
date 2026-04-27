@@ -53,25 +53,68 @@ export class NotificationService {
     });
   }
 
+  /// Lazily anchor the earliest notification a (tenant,user) pair may see.
+  /// First call creates the cutoff at "now"; subsequent calls return the
+  /// stored sinceAt. This is the mechanism that prevents a freshly-added
+  /// user from inheriting the full historical bell feed of the
+  /// organization / dashboard they just joined.
+  private async getOrCreateCutoff(tenantId: string, userId: string): Promise<Date> {
+    const row = await prisma.notificationVisibilityCutoff.upsert({
+      where: { tenantId_userId: { tenantId, userId } },
+      create: { tenantId, userId },
+      update: {},
+      select: { sinceAt: true },
+    });
+    return row.sinceAt;
+  }
+
+  /// Build the visibility OR clause for a (tenant,user). Every branch is
+  /// implicitly AND'd with `createdAt >= sinceAt` by the caller so users
+  /// never see notifications older than their own join cutoff.
+  ///
+  /// Branches:
+  ///   1. Tenant broadcast (userId=null) inside the active tenant.
+  ///   2. User-targeted row inside the active tenant.
+  ///   3. User-targeted row in a different tenant — but only if the user
+  ///      has previously observed that tenant (i.e. has a cutoff row for
+  ///      it). This keeps the existing cross-tenant override path for
+  ///      operators that switched active org while making sure brand-new
+  ///      users don't inherit notifications from "other dashboards".
+  private async buildVisibility(
+    tenantId: string,
+    userId: string | undefined,
+  ): Promise<Prisma.NotificationWhereInput[]> {
+    const branches: Prisma.NotificationWhereInput[] = [
+      { tenantId, userId: null },
+    ];
+    if (!userId) return branches;
+    branches.push({ tenantId, userId });
+    const otherTenants = await prisma.notificationVisibilityCutoff.findMany({
+      where: { userId, NOT: { tenantId } },
+      select: { tenantId: true },
+    });
+    if (otherTenants.length > 0) {
+      branches.push({
+        userId,
+        tenantId: { in: otherTenants.map((t) => t.tenantId) },
+      });
+    }
+    return branches;
+  }
+
   async list(q: ListQuery) {
     const skip = Math.max(0, q.skipCount ?? 0);
     const take = Math.min(200, Math.max(1, q.maxResultCount ?? 50));
-    // Visibility model:
-    //   - org broadcast row (userId=null) in the active tenant is shown to
-    //     every user of that tenant.
-    //   - user-targeted row in the active tenant is shown to that user.
-    //   - user-targeted row in a different tenant is also shown to that user
-    //     (covers operators that switched their active org in the UI).
     // Read state is per-user, derived from NotificationReceipt — see below.
-    const visibility: Prisma.NotificationWhereInput[] = [
-      { tenantId: q.tenantId, userId: null },
-    ];
-    if (q.userId) {
-      visibility.push({ tenantId: q.tenantId, userId: q.userId });
-      visibility.push({ userId: q.userId });
-    }
+    const sinceAt = q.userId
+      ? await this.getOrCreateCutoff(q.tenantId, q.userId)
+      : new Date(0);
+    const visibility = await this.buildVisibility(q.tenantId, q.userId);
     const where: Prisma.NotificationWhereInput = {
-      OR: visibility,
+      AND: [
+        { OR: visibility },
+        { createdAt: { gte: sinceAt } },
+      ],
       category: q.category,
     };
     if (q.isRead !== undefined && q.userId) {
@@ -97,12 +140,13 @@ export class NotificationService {
   }
 
   async unreadCount(tenantId: string, userId: string) {
+    const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId);
     return prisma.notification.count({
       where: {
-        OR: [
-          { tenantId, userId: null },
-          { tenantId, userId },
-          { userId },
+        AND: [
+          { OR: visibility },
+          { createdAt: { gte: sinceAt } },
         ],
         receipts: { none: { userId } },
       },
@@ -110,13 +154,14 @@ export class NotificationService {
   }
 
   async markRead(id: string, tenantId: string, userId: string) {
+    const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId);
     const n = await prisma.notification.findFirst({
       where: {
         id,
-        OR: [
-          { tenantId, userId: null },
-          { tenantId, userId },
-          { userId },
+        AND: [
+          { OR: visibility },
+          { createdAt: { gte: sinceAt } },
         ],
       },
       include: { receipts: { where: { userId }, take: 1 } },
@@ -137,12 +182,13 @@ export class NotificationService {
   async markAllRead(tenantId: string, userId: string) {
     // Find every visible-to-user notification that does NOT yet have a
     // receipt for this user, then create the receipts in one shot.
+    const sinceAt = await this.getOrCreateCutoff(tenantId, userId);
+    const visibility = await this.buildVisibility(tenantId, userId);
     const targets = await prisma.notification.findMany({
       where: {
-        OR: [
-          { tenantId, userId: null },
-          { tenantId, userId },
-          { userId },
+        AND: [
+          { OR: visibility },
+          { createdAt: { gte: sinceAt } },
         ],
         receipts: { none: { userId } },
       },

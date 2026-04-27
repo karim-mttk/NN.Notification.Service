@@ -568,3 +568,129 @@ partial-payment dispatcher rewrite.
 container if the image hash is unchanged but you also bumped a
 schema/code path that relied on the new image — when in doubt,
 `docker rm -f <name> && docker compose up -d` to force recreate.
+
+
+## Apr 27 2026 — New users inherited the entire bell history
+
+### Symptom (reported)
+Newly added users opened the dashboard and immediately saw past
+notifications in their bell, including notifications that had been
+generated for "other dashboards" / other contexts in the same org. Bell
+unread badge was non-zero on first login despite the user never having
+been emitted to.
+
+### Root Cause
+Two facts collided:
+
+1. Org-wide notifications are stored as `Notifications.userId IS NULL`
+   ("broadcast"). Every user of that tenant is supposed to see them.
+2. Read state is per-user via `NotificationReceipts` (Apr 24 Turn 3
+   change). A row is unread for a user iff no receipt exists.
+
+A brand-new user has zero receipts — so every historical broadcast in
+the tenant counts as unread for them. They literally inherited the full
+backlog of the org / every dashboard surface that emits into that tenant
+(operations payments, sales, system alerts, etc.).
+
+There was also a defense-in-depth gap: `notification.service.ts` had a
+loose third visibility branch `{ userId: q.userId }` that returned ANY
+notification with that user id regardless of tenant. For brand-new users
+this was empty in practice, but it left the door open for cross-tenant
+leakage.
+
+### Fix
+New per-user, per-tenant join cutoff. A row in
+`NotificationVisibilityCutoffs (tenantId, userId, sinceAt)` anchors the
+earliest notification that user is allowed to see in that tenant.
+`Notifications.createdAt < sinceAt` are invisible.
+
+Created lazily on the FIRST bell touch (`list` / `unreadCount` /
+`markRead` / `markAllRead`) — first call upserts `sinceAt = now()`,
+subsequent calls reuse it. Net effect: a freshly-added user's bell is
+empty until the next notification arrives, and they only ever see
+notifications generated *after* they joined.
+
+The cross-tenant fallback was tightened: `{ userId }` is now restricted
+to tenants for which the user already has a cutoff row, i.e. tenants
+they've engaged with before. This preserves the cross-org operator path
+(see Apr 24 Turn 1/2) without leaking unrelated tenants to newcomers.
+
+Files touched:
+
+- `prisma/schema.prisma`: added `NotificationVisibilityCutoff` model
+  (composite PK `(tenantId, userId)`).
+- `src/index.ts`: idempotent `ensureSchema()` at startup runs
+  `CREATE TABLE IF NOT EXISTS "NotificationVisibilityCutoffs"` plus a
+  one-time **backfill** that inserts `sinceAt = TIMESTAMP 'epoch'` for
+  every (tenant,user) pair derivable from existing `NotificationReceipts`
+  or user-targeted `Notifications.userId IS NOT NULL` rows. Backfill is
+  `ON CONFLICT DO NOTHING` so it's safe to re-run.
+- `src/modules/notification/notification.service.ts`:
+  - `getOrCreateCutoff(tenantId, userId)` upsert helper.
+  - `buildVisibility(tenantId, userId)` returns the OR branches and
+    constrains the cross-tenant branch to tenants the user has touched.
+  - All four query paths now `AND` the visibility OR with
+    `createdAt: { gte: sinceAt }`.
+
+### Why backfill matters
+Without backfill, an existing operator whose first post-deploy bell hit
+happens AFTER a fresh notification arrives would silently lose visibility
+of any pre-deploy unread items because their lazy cutoff would be
+created at "now". The backfill anchors known existing users at epoch so
+their bell looks identical to before the fix. Only brand-new
+(tenant,user) pairs get a real "now" cutoff.
+
+### Validation (Apr 27 2026)
+
+Tenant `e986dd42-5dbf-42df-94af-aab4c4cbab52` had 15 historical
+notifications including 10 broadcasts.
+
+Brand-new user (random UUID, never seen before) — JWT with `sub` +
+`organization_id`:
+
+```
+GET /api/notifications/unread-count   -> {"count":0}
+GET /api/notifications?maxResultCount=5 -> {"items":[],"total":0}
+SELECT * FROM "NotificationVisibilityCutoffs" WHERE "userId"='...'
+   -> sinceAt = 2026-04-27T17:10:06.147Z   (lazy create)
+```
+
+Then injected one fresh broadcast row for that tenant:
+
+```
+GET /api/notifications/unread-count   -> {"count":1}
+GET /api/notifications                -> the single post-cutoff row only
+```
+
+Existing operator `019db03b-b446-793b-9820-2384ff608809` (in backfill):
+
+```
+GET /api/notifications/unread-count   -> {"count":10}   (unchanged)
+```
+
+Backfill counted 8 (tenant,user) pairs anchored at epoch.
+
+### Rebuild
+
+```sh
+cd /home/neura/project/NN.Notification.Service && \
+  docker compose up -d --build notification-service
+```
+
+Schema bootstrap log line to look for:
+`Schema bootstrap: NotificationVisibilityCutoffs ensured`.
+
+### What to check first if this regresses
+
+1. Does `NotificationVisibilityCutoffs` exist? `\d` it from psql or run
+   the same `information_schema.columns` probe used in validation.
+2. For the affected user: does a cutoff row exist? If so, what is
+   `sinceAt`? If it's in the past relative to the missing notifications,
+   the cutoff is fine — look elsewhere.
+3. For brand-new users seeing leaks: confirm `getOrCreateCutoff` is
+   running on `list` / `unreadCount` (it must be the FIRST awaited line
+   in those methods) and that the AND clause `createdAt >= sinceAt` is
+   present in the generated Prisma query.
+4. For existing users that suddenly see nothing: backfill probably
+   didn't run. Manually backfill with the two `INSERT ... ON CONFLICT DO
+   NOTHING` statements from `ensureSchema()`.
